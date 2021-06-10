@@ -20,7 +20,7 @@ import {
   getNodesByType,
   getTypes,
 } from "../datastore"
-import { runFastFiltersAndSort } from "../datastore/in-memory/run-fast-filters"
+import { isIterable } from "../datastore/common/iterable"
 
 type TypeOrTypeName = string | GraphQLOutputType
 
@@ -75,7 +75,7 @@ class LocalNodeModel {
     this.createPageDependencyActionCreator = createPageDependency
 
     this._rootNodeMap = new WeakMap()
-    this._trackedRootNodes = new Set()
+    this._trackedRootNodes = new WeakSet()
     this._prepareNodesQueues = {}
     this._prepareNodesPromises = {}
     this._preparedNodesCache = new Map()
@@ -280,7 +280,10 @@ class LocalNodeModel {
       nodeTypeNames
     )
 
-    await this.prepareNodes(gqlType, fields, fieldsToResolve, nodeTypeNames)
+    for (const nodeTypeName of nodeTypeNames) {
+      const gqlNodeType = this.schema.getType(nodeTypeName)
+      await this.prepareNodes(gqlNodeType, fields, fieldsToResolve)
+    }
 
     if (materializationActivity) {
       materializationActivity.end()
@@ -294,7 +297,7 @@ class LocalNodeModel {
       runQueryActivity.start()
     }
 
-    const { entries, totalCount } = runFastFiltersAndSort({
+    const { entries, totalCount } = await getDataStore().runQuery({
       queryArgs: query,
       gqlSchema: this.schema,
       gqlComposer: this.schemaComposer,
@@ -309,23 +312,15 @@ class LocalNodeModel {
       runQueryActivity.end()
     }
 
-    let trackInlineObjectsActivity
-    if (tracer) {
-      trackInlineObjectsActivity = reporter.phantomActivity(
-        `trackInlineObjects`,
-        {
-          parentSpan: tracer.getParentActivity().span,
-        }
-      )
-      trackInlineObjectsActivity.start()
+    return {
+      gqlType,
+      entries: entries.map(node => {
+        // With GatsbyIterable it happens lazily as we iterate
+        this.trackInlineObjectsInRootNode(node)
+        return node
+      }),
+      totalCount,
     }
-
-    entries.forEach(node => this.trackInlineObjectsInRootNode(node))
-
-    if (trackInlineObjectsActivity) {
-      trackInlineObjectsActivity.end()
-    }
-    return { gqlType, entries, totalCount }
   }
 
   /**
@@ -391,7 +386,7 @@ class LocalNodeModel {
     return this.trackPageDependencies(first, pageDependencies)
   }
 
-  prepareNodes(type, queryFields, fieldsToResolve, nodeTypeNames) {
+  prepareNodes(type, queryFields, fieldsToResolve) {
     const typeName = type.name
     if (!this._prepareNodesQueues[typeName]) {
       this._prepareNodesQueues[typeName] = []
@@ -405,7 +400,7 @@ class LocalNodeModel {
     if (!this._prepareNodesPromises[typeName]) {
       this._prepareNodesPromises[typeName] = new Promise(resolve => {
         process.nextTick(async () => {
-          await this._doResolvePrepareNodesQueue(type, nodeTypeNames)
+          await this._doResolvePrepareNodesQueue(type)
           resolve()
         })
       })
@@ -414,7 +409,7 @@ class LocalNodeModel {
     return this._prepareNodesPromises[typeName]
   }
 
-  async _doResolvePrepareNodesQueue(type, nodeTypeNames) {
+  async _doResolvePrepareNodesQueue(type) {
     const typeName = type.name
     const queue = this._prepareNodesQueues[typeName]
     this._prepareNodesQueues[typeName] = []
@@ -442,7 +437,8 @@ class LocalNodeModel {
     )
 
     if (!_.isEmpty(actualFieldsToResolve)) {
-      await saveResolvedNodes(nodeTypeNames, async node => {
+      const resolvedNodes = new Map()
+      for (const node of getDataStore().iterateNodesByType(typeName)) {
         this.trackInlineObjectsInRootNode(node)
         const resolvedFields = await resolveRecursive(
           this,
@@ -456,8 +452,14 @@ class LocalNodeModel {
         if (!node.__gatsby_resolved) {
           node.__gatsby_resolved = {}
         }
-        return _.merge(node.__gatsby_resolved, resolvedFields)
-      })
+        resolvedNodes.set(
+          node.id,
+          _.merge(node.__gatsby_resolved, resolvedFields)
+        )
+      }
+      if (resolvedNodes.size) {
+        await saveResolvedNodes(typeName, resolvedNodes)
+      }
       this._preparedNodesCache.set(
         typeName,
         _.merge(
@@ -484,7 +486,7 @@ class LocalNodeModel {
    * @param {Node} node Root Node
    */
   trackInlineObjectsInRootNode(node) {
-    if (!this._trackedRootNodes.has(node.id)) {
+    if (!this._trackedRootNodes.has(node)) {
       addRootNodeToInlineObject(
         this._rootNodeMap,
         node,
@@ -492,7 +494,7 @@ class LocalNodeModel {
         true,
         new Set()
       )
-      this._trackedRootNodes.add(node.id)
+      this._trackedRootNodes.add(node)
     }
   }
 
@@ -546,7 +548,7 @@ class LocalNodeModel {
       if (connectionType) {
         this.createPageDependency({ path, connection: connectionType })
       } else {
-        const nodes = Array.isArray(result) ? result : [result]
+        const nodes = isIterable(result) ? result : [result]
         for (const node of nodes) {
           if (node) {
             this.createPageDependency({ path, nodeId: node.id })
@@ -940,23 +942,14 @@ const addRootNodeToInlineObject = (
   }
 }
 
-const saveResolvedNodes = async (nodeTypeNames, resolver) => {
-  for (const typeName of nodeTypeNames) {
-    const resolvedNodes = new Map()
-    for (const node of getDataStore().iterateNodesByType(typeName)) {
-      const resolved = await resolver(node)
-      resolvedNodes.set(node.id, resolved)
-    }
-    if (!resolvedNodes.size) continue
-
-    store.dispatch({
-      type: `SET_RESOLVED_NODES`,
-      payload: {
-        key: typeName,
-        nodes: resolvedNodes,
-      },
-    })
-  }
+const saveResolvedNodes = async (typeName, resolvedNodes) => {
+  store.dispatch({
+    type: `SET_RESOLVED_NODES`,
+    payload: {
+      key: typeName,
+      nodes: resolvedNodes,
+    },
+  })
 }
 
 const deepObjectDifference = (from, to) => {
